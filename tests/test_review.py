@@ -2,16 +2,19 @@
 
 覆盖：
 1. 小图独立枚举对拍：随机小图 × 全部合法（污染源, 保护区）划分 ×
-   多组现场已关闭子集，与暴力枚举所有源侧集合的结果对拍，并验证
-   合并后的隔断见证确实切断冻结方案中的全部污染路径；
+   多组现场已关闭子集，并额外枚举每条边“已关闭 / 必须保持开启 /
+   可追加切断”的全部状态组合，与暴力枚举所有可选切断集合的结果对拍，
+   并验证合并后的隔断见证确实切断冻结方案中的全部污染路径；
 2. 非建议管段先被关闭：复核在剩余网络上重新求最优，而不是机械补齐
    原建议清单；
-3. 零费用边与"若已隔断则新增清单为空"；
-4. 方案修订后复核：只能引用采用时冻结的方案版本（后来修订的同名
+3. 零费用边、必须保持开启边与“若已隔断则新增清单为空”；
+4. 保持开启约束使方案不可执行时，返回不可执行且不写记录；
+5. 方案修订后复核：只能引用采用时冻结的方案版本（后来修订的同名
    管段费用不得混入），且复核不修改原方案、计算记录与采用快照；
-5. 复核记录冻结输入与结果，按 ID 在新会话（重启后）读取一致，
+6. 复核记录冻结两类输入与结果，按 ID 在新会话（重启后）读取一致，
    多线程并发读取也一致；
-6. 未知/重复管段、无采用结果、数据库写入失败都不留下半条复核记录。
+7. 未知/重复管段、两类约束重叠、无采用结果、数据库写入失败都不留下
+   半条复核记录。
 """
 
 import random
@@ -23,7 +26,7 @@ import pytest
 from app import services
 from app.db import SessionLocal
 from app.errors import ApiError
-from app.flow import solve_residual_min_cut
+from app.flow import ResidualCutInfeasible, solve_residual_min_cut
 from app.models import Review
 
 VALID_PLAN = {
@@ -83,10 +86,11 @@ def adopt(client, pid, cid):
     return client.post(f"/plans/{pid}/adopt", json={"computation_id": cid})
 
 
-def review(client, pid, closed):
-    return client.post(
-        f"/plans/{pid}/reviews", json={"closed_segments": closed}
-    )
+def review(client, pid, closed, keep_open=None):
+    body = {"closed_segments": closed}
+    if keep_open is not None:
+        body["keep_open_segments"] = keep_open
+    return client.post(f"/plans/{pid}/reviews", json=body)
 
 
 def adopt_plan(client, pid, plan=VALID_PLAN):
@@ -172,6 +176,78 @@ def brute_force_residual(plan, closed):
     return side, additional, best_cost
 
 
+def brute_force_constrained_residual(plan, closed, keep_open):
+    """枚举所有可切断管子集，独立求带“必须保持开启”约束的最优复核。
+
+    已关闭边先删除；保持开启边不允许放入切断集合；其余每条边都可选关闭。
+    用 BFS 枚举每个候选集合是否可隔断，并在全部最低费用可行集合的可达源侧
+    交集上取唯一边界，复刻“最低追加费用 + 最小源侧 + 排序”的裁决。
+    """
+    closed, keep_open = set(closed), set(keep_open)
+    assert not closed & keep_open
+    by_id = {seg["id"]: seg for seg in plan["segments"]}
+    candidate_ids = [
+        seg["id"]
+        for seg in plan["segments"]
+        if seg["id"] not in closed and seg["id"] not in keep_open
+    ]
+
+    def reachable_after_removal(removed):
+        adjacency = {}
+        for seg in plan["segments"]:
+            if seg["id"] in removed:
+                continue
+            adjacency.setdefault(seg["from"], []).append(seg["to"])
+        seen = set(plan["sources"])
+        queue = deque(plan["sources"])
+        while queue:
+            node = queue.popleft()
+            for nxt in adjacency.get(node, []):
+                if nxt not in seen:
+                    seen.add(nxt)
+                    queue.append(nxt)
+        return seen
+
+    feasible = []
+    best_cost = None
+    for mask in range(1 << len(candidate_ids)):
+        additional = {
+            seg_id for i, seg_id in enumerate(candidate_ids) if mask & (1 << i)
+        }
+        reachable = reachable_after_removal(closed | additional)
+        if reachable.isdisjoint(plan["protections"]):
+            cost = sum(by_id[seg_id]["cost"] for seg_id in additional)
+            feasible.append((additional, cost, reachable))
+            if best_cost is None or cost < best_cost:
+                best_cost = cost
+
+    if best_cost is None:
+        return None
+
+    minimum_sets = [
+        (additional, reachable)
+        for additional, cost, reachable in feasible
+        if cost == best_cost
+    ]
+    intersection_reachable = None
+    for _, reachable in minimum_sets:
+        intersection_reachable = (
+            set(reachable)
+            if intersection_reachable is None
+            else intersection_reachable & reachable
+        )
+
+    side = sorted(zone for zone in plan["zones"] if zone in intersection_reachable)
+    additional = sorted(
+        seg["id"]
+        for seg in plan["segments"]
+        if seg["id"] in candidate_ids
+        and seg["from"] in intersection_reachable
+        and seg["to"] not in intersection_reachable
+    )
+    return side, additional, best_cost
+
+
 def all_legal_partitions(zones):
     n = len(zones)
     full = (1 << n) - 1
@@ -248,6 +324,64 @@ def test_residual_review_matches_brute_force(seed):
             # 新增清单与现场已关闭互不相交
             assert not set(additional) & closed
             # 合并清单确实切断冻结方案中的全部污染路径
+            assert cut_isolates_sources(plan, merged)
+
+
+def test_constrained_residual_review_matches_brute_force():
+    """小图枚举每个“已关闭 / 保持开启 / 可追加切断”状态并与算法对拍。"""
+    zones = ["Z0", "Z1", "Z2", "Z3"]
+    segments = [
+        {"id": "e0", "from": "Z0", "to": "Z1", "cost": 0},
+        {"id": "e1", "from": "Z1", "to": "Z2", "cost": 3},
+        {"id": "e2", "from": "Z2", "to": "Z3", "cost": 2},
+        {"id": "e3", "from": "Z0", "to": "Z3", "cost": 5},
+        {"id": "e4", "from": "Z3", "to": "Z1", "cost": 1},
+    ]
+    cost_by_id = {seg["id"]: seg["cost"] for seg in segments}
+    states = ("remaining", "closed", "keep_open")
+
+    for sources, protections in all_legal_partitions(zones):
+        plan = {
+            "zones": zones,
+            "segments": segments,
+            "sources": sources,
+            "protections": protections,
+        }
+        for state_mask in range(len(states) ** len(segments)):
+            closed, keep_open = set(), set()
+            value = state_mask
+            for i in range(len(segments)):
+                state = states[value % len(states)]
+                value //= len(states)
+                if state == "closed":
+                    closed.add(segments[i]["id"])
+                elif state == "keep_open":
+                    keep_open.add(segments[i]["id"])
+
+            expected = brute_force_constrained_residual(plan, closed, keep_open)
+            if expected is None:
+                with pytest.raises(ResidualCutInfeasible):
+                    solve_residual_min_cut(plan, closed, keep_open)
+                continue
+
+            side, additional, best_cost = expected
+            outcome = solve_residual_min_cut(plan, closed, keep_open)
+            assert outcome["closed_segments"] == sorted(closed)
+            assert outcome["keep_open_segments"] == sorted(keep_open)
+            assert outcome["additional_segments"] == additional, (
+                sources,
+                protections,
+                closed,
+                keep_open,
+            )
+            assert outcome["additional_cost"] == best_cost
+            assert outcome["witness"]["source_zones"] == side
+            merged = sorted(closed | set(additional))
+            assert outcome["witness"]["cut_segments"] == merged
+            assert outcome["witness"]["total_cost"] == sum(
+                cost_by_id[seg_id] for seg_id in merged
+            )
+            assert not (set(additional) & (closed | keep_open))
             assert cut_isolates_sources(plan, merged)
 
 
@@ -345,6 +479,72 @@ def test_review_already_isolated_gives_empty_additional(client):
     assert record["witness"]["source_zones"] == ["S"]
 
 
+def test_review_keep_open_forces_min_cost_additional_cut(client):
+    """必须保持开启的边不可切断，算法只能在其余边中选最低追加隔断。"""
+    pid = "review-keep-open"
+    cid = adopt_plan(client, pid)
+    resp = review(client, pid, [], keep_open=["p1"])
+    assert resp.status_code == 200
+    record = resp.json()
+    assert record["computation_id"] == cid
+    assert record["closed_segments"] == []
+    assert record["keep_open_segments"] == ["p1"]
+    assert record["additional_segments"] == ["p3", "p4"]
+    assert record["additional_cost"] == 12
+    assert record["witness"] == {
+        "source_zones": ["MID", "SRC1", "SRC2"],
+        "cut_segments": ["p3", "p4"],
+        "total_cost": 12,
+    }
+    assert cut_isolates_sources(VALID_PLAN, record["witness"]["cut_segments"])
+    assert "p1" not in record["witness"]["cut_segments"]
+
+
+def test_review_keep_open_zero_cost_edge_picks_positive_alternative(client):
+    pid = "review-keep-open-zero"
+    adopt_plan(client, pid, ZERO_PLAN)
+    resp = review(client, pid, [], keep_open=["z"])
+    assert resp.status_code == 200
+    record = resp.json()
+    assert record["keep_open_segments"] == ["z"]
+    assert record["additional_segments"] == ["w"]
+    assert record["additional_cost"] == 5
+    assert record["witness"] == {
+        "source_zones": ["S", "A"],
+        "cut_segments": ["w"],
+        "total_cost": 5,
+    }
+    assert cut_isolates_sources(ZERO_PLAN, ["w"])
+
+
+def test_review_keep_open_does_not_duplicate_already_isolated_constraint(client):
+    pid = "review-keep-open-isolated"
+    adopt_plan(client, pid)
+    record = review(client, pid, ["p1", "p2"], keep_open=["p3"]).json()
+    assert record["keep_open_segments"] == ["p3"]
+    assert record["additional_segments"] == []
+    assert record["additional_cost"] == 0
+    assert record["witness"]["cut_segments"] == ["p1", "p2"]
+
+
+def test_review_infeasible_when_required_open_path_remains(client):
+    """保持开启约束保留源到保护区路径：明确不可执行，且不写复核记录。"""
+    pid = "review-infeasible"
+    adopt_plan(client, pid)
+    resp = review(client, pid, [], keep_open=["p1", "p3"])
+    assert resp.status_code == 422
+    error = resp.json()["error"]
+    assert error["code"] == "REVIEW_NOT_EXECUTABLE"
+    assert {d["code"] for d in error["details"]} == {"REQUIRED_OPEN_PATH"}
+    assert count_reviews(pid) == 0
+
+    # 即使关闭其他路径，保持开启的路径仍存在时仍不可执行
+    resp = review(client, pid, ["p2", "p4"], keep_open=["p1", "p3"])
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "REVIEW_NOT_EXECUTABLE"
+    assert count_reviews(pid) == 0
+
+
 # ---------- 4. 方案修订后复核：冻结版本 ----------
 
 def test_review_after_revision_uses_frozen_plan_and_changes_nothing(client):
@@ -377,6 +577,21 @@ def test_review_after_revision_uses_frozen_plan_and_changes_nothing(client):
         client.get(f"/plans/{pid}/computations/{cid}").json()
         == computation_before
     )
+
+
+def test_review_keep_open_after_revision_uses_frozen_costs(client):
+    """保持开启约束下，追加边费用仍只能来自采用时冻结的版本。"""
+    pid = "review-keep-open-frozen"
+    cid = adopt_plan(client, pid)
+    put(client, pid, REVISED_PLAN)  # p4: 7 -> 1
+
+    record = review(client, pid, [], keep_open=["p1"]).json()
+    assert record["plan_revision"] == 1
+    assert record["computation_id"] == cid
+    assert record["keep_open_segments"] == ["p1"]
+    assert record["additional_segments"] == ["p3", "p4"]
+    assert record["additional_cost"] == 12
+    assert record["witness"]["total_cost"] == 12
 
 
 def test_review_cannot_reference_segment_added_by_later_revision(client):
@@ -489,6 +704,56 @@ def test_review_unknown_segment_rejected_without_record(client):
     assert count_reviews(pid) == 0
 
 
+def test_review_unknown_keep_open_segment_rejected_without_record(client):
+    pid = "review-unknown-keep-open"
+    adopt_plan(client, pid)
+    put(client, pid, EXTENDED_PLAN)  # 第 2 版新增 p9，但当前采用仍冻结第 1 版
+    resp = review(client, pid, ["p1"], keep_open=["p9"])
+    assert resp.status_code == 422
+    error = resp.json()["error"]
+    assert error["code"] == "VALIDATION_ERROR"
+    assert {d["code"] for d in error["details"]} == {"UNKNOWN_SEGMENT"}
+    assert count_reviews(pid) == 0
+
+
+def test_review_closed_and_keep_open_must_be_disjoint(client):
+    pid = "review-constraint-overlap"
+    adopt_plan(client, pid)
+    resp = review(client, pid, ["p1", "p2"], keep_open=["p2", "p3"])
+    assert resp.status_code == 422
+    error = resp.json()["error"]
+    assert error["code"] == "VALIDATION_ERROR"
+    assert {
+        d["code"] for d in error["details"]
+    } == {"CLOSED_KEEP_OPEN_OVERLAP"}
+    assert count_reviews(pid) == 0
+
+
+def test_review_empty_keep_open_list_is_frozen_with_legacy_compatibility(client):
+    pid = "review-keep-open-compatibility"
+    adopt_plan(client, pid)
+
+    legacy = client.post(
+        f"/plans/{pid}/reviews", json={"closed_segments": ["p1"]}
+    ).json()
+    assert "keep_open_segments" not in legacy
+    got_legacy = client.get(
+        f"/plans/{pid}/reviews/{legacy['review_id']}"
+    ).json()
+    assert "keep_open_segments" not in got_legacy
+
+    explicit_empty = client.post(
+        f"/plans/{pid}/reviews",
+        json={"closed_segments": ["p1"], "keep_open_segments": []},
+    ).json()
+    assert explicit_empty["keep_open_segments"] == []
+    got_empty = client.get(
+        f"/plans/{pid}/reviews/{explicit_empty['review_id']}"
+    ).json()
+    assert got_empty == explicit_empty
+    assert count_reviews(pid) == 2
+
+
 def test_review_duplicate_segment_rejected_without_record(client):
     pid = "review-dup"
     adopt_plan(client, pid)
@@ -507,6 +772,22 @@ INVALID_BODIES = [
     ({"closed_segments": None}, "INVALID_CLOSED_SEGMENTS_FIELD"),
     ({"closed_segments": [1]}, "INVALID_SEGMENT_ID"),
     ({"closed_segments": ["bad id"]}, "INVALID_SEGMENT_ID"),
+    (
+        {"closed_segments": [], "keep_open_segments": "p1"},
+        "INVALID_KEEP_OPEN_SEGMENTS_FIELD",
+    ),
+    (
+        {"closed_segments": [], "keep_open_segments": None},
+        "INVALID_KEEP_OPEN_SEGMENTS_FIELD",
+    ),
+    (
+        {"closed_segments": [], "keep_open_segments": [1]},
+        "INVALID_SEGMENT_ID",
+    ),
+    (
+        {"closed_segments": [], "keep_open_segments": ["p1", "p1"]},
+        "DUPLICATE_SEGMENT_ID",
+    ),
 ]
 
 
@@ -576,7 +857,7 @@ def test_db_write_failure_leaves_no_partial_review_record(client):
     db.commit = failing_commit
     try:
         with pytest.raises(ApiError) as excinfo:
-            services.review(db, pid, ["p1"])
+            services.review(db, pid, ["p2"], ["p1"])
         assert excinfo.value.status_code == 500
         assert excinfo.value.code == "INTERNAL_ERROR"
     finally:

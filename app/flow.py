@@ -29,6 +29,10 @@ class _Edge:
         self.cap = cap
 
 
+class ResidualCutInfeasible(Exception):
+    """保持开启约束使污染源与保护区之间存在无法切断的路径。"""
+
+
 class Dinic:
     """64 位整数容量的 Dinic 最大流。"""
 
@@ -139,41 +143,102 @@ def solve_min_cut(plan):
     }
 
 
-def solve_residual_min_cut(plan, closed_segment_ids):
-    """在移除现场已关闭管段后的剩余有向网络上，求追加关闭费用最小的隔断。
+def solve_residual_min_cut(plan, closed_segment_ids, keep_open_segment_ids=None):
+    """在现场约束后的有向网络上，求追加关闭费用最小的隔断。
 
-    现场已关闭的管段被视为已移除（容量无穷或删除等价于不参与隔断），
-    随后完全沿用 solve_min_cut 的建模与裁决：所有最低费用割中取源侧
-    区域集合按包含关系最小的唯一方案，结果按字典序升序。plan 必须是
-    调用方（持久层/接口/校验）共同冻结的同一版本，不得混入后来修订的
-    同名管段费用。
+    现场已关闭的管段视为已移除；必须保持开启的管段视为不可切断（容量为
+    INF）。算法仍沿用 solve_min_cut 的建模与裁决：所有最低费用割中取源侧
+    区域集合按包含关系最小的唯一方案，结果按字典序升序。plan 必须是调用方
+    （持久层/接口/校验）共同冻结的同一版本，不得混入后来修订的同名管段费用。
+
+    若仅由保持开启管段构成的路径仍连通任一污染源与任一保护区，则关闭其余
+    任何可切断管段都无法隔断，抛出 ResidualCutInfeasible，调用方不得落库。
+    保持开启管段上容量为 INF；它严格大于所有可切断管段费用之和，因此可行
+    网络的最低费用割绝不会切断保持开启边或源/汇约束边。
 
     返回::
 
         {
           "closed_segments": 升序的现场已关闭管段,
+          "keep_open_segments": 升序的必须保持开启管段（提供该约束时存在）,
           "additional_segments": 升序的新增建议关闭管段（已隔断时为空）,
           "additional_cost": 新增关闭费用之和,
           "witness": {
-            "source_zones": 剩余网络最小割的源侧区域（升序）,
+            "source_zones": 约束网络最小割的源侧区域（升序）,
             "cut_segments": 已关闭∪新增的合并隔断清单（升序）,
             "total_cost": 合并清单按冻结方案费用求和,
           },
         }
     """
     closed = set(closed_segment_ids)
+    keep_open = set(keep_open_segment_ids or ())
     remaining = [seg for seg in plan["segments"] if seg["id"] not in closed]
-    residual = solve_min_cut({**plan, "segments": remaining})
+    optional = [seg for seg in remaining if seg["id"] not in keep_open]
 
+    def reachable_with_required_edges_only():
+        adjacency = {}
+        for seg in remaining:
+            if seg["id"] in keep_open:
+                adjacency.setdefault(seg["from"], []).append(seg["to"])
+        seen = set(plan["sources"])
+        stack = list(plan["sources"])
+        while stack:
+            node = stack.pop()
+            for nxt in adjacency.get(node, []):
+                if nxt not in seen:
+                    if nxt in plan["protections"]:
+                        return True
+                    seen.add(nxt)
+                    stack.append(nxt)
+        return False
+
+    if reachable_with_required_edges_only():
+        raise ResidualCutInfeasible(
+            "a required-open path still connects a pollution source to a protected zone"
+        )
+
+    zones = plan["zones"]
+    ordered = sorted(zones)
+    index = {zone: i + 2 for i, zone in enumerate(ordered)}
+    super_source, super_sink = 0, 1
+    dinic = Dinic(len(ordered) + 2)
+    total_optional_capacity = sum(seg["cost"] for seg in optional)
+    infinity = total_optional_capacity + 1
+
+    for zone in plan["sources"]:
+        dinic.add_edge(super_source, index[zone], infinity)
+    for zone in plan["protections"]:
+        dinic.add_edge(index[zone], super_sink, infinity)
+    for seg in optional:
+        dinic.add_edge(index[seg["from"]], index[seg["to"]], seg["cost"])
+    for seg in remaining:
+        if seg["id"] in keep_open:
+            dinic.add_edge(index[seg["from"]], index[seg["to"]], infinity)
+
+    dinic.max_flow(super_source, super_sink)
+    reachable = dinic.reachable_from(super_source)
+    on_source_side = {zone: reachable[index[zone]] for zone in ordered}
+    source_zones = [zone for zone in ordered if on_source_side[zone]]
+    additional = sorted(
+        seg["id"]
+        # 保持开启边不可能穿越最低费用割；按方案原始顺序收集后统一排序。
+        for seg in optional
+        if on_source_side[seg["from"]] and not on_source_side[seg["to"]]
+    )
     cost_by_id = {seg["id"]: seg["cost"] for seg in plan["segments"]}
-    merged = sorted(closed | set(residual["cut_segments"]))
-    return {
+    additional_cost = sum(cost_by_id[seg_id] for seg_id in additional)
+
+    merged = sorted(closed | set(additional))
+    outcome = {
         "closed_segments": sorted(closed),
-        "additional_segments": residual["cut_segments"],
-        "additional_cost": residual["total_cost"],
+        "additional_segments": additional,
+        "additional_cost": additional_cost,
         "witness": {
-            "source_zones": residual["source_zones"],
+            "source_zones": source_zones,
             "cut_segments": merged,
             "total_cost": sum(cost_by_id[seg_id] for seg_id in merged),
         },
     }
+    if keep_open_segment_ids is not None:
+        outcome["keep_open_segments"] = sorted(keep_open)
+    return outcome

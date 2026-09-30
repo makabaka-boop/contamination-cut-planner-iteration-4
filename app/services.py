@@ -27,10 +27,11 @@
   持锁前后一致时才允许写入，否则以 409 ADOPTION_CONFLICT 拒绝，
   保证并发采用的返回结果确定且与最终记录一致。任何失败/冲突都
   回滚，当前方案与原采用快照不变。
-- 复核只读取当前生效采用快照中冻结的方案（不读取当前方案），
-  已关闭管段的存在性校验、剩余网络求解与记录落库共享同一冻结版本；
-  校验失败在写入前拒绝，单行写入失败整体回滚，绝不留下半条复核
-  记录，也不修改方案、计算记录与采用快照。
+- 复核只读取当前生效采用快照中冻结的方案（不读取当前方案），两类现场
+  约束（已关闭、必须保持开启）的存在性/互斥校验、约束网络求解与记录
+  落库共享同一冻结版本；已关闭边视为移除，保持开启边视为不可切断。
+  校验失败或约束使方案不可执行都在写入前拒绝，单行写入失败整体回滚，
+  绝不留下半条复核记录，也不修改方案、计算记录与采用快照。
 """
 
 import uuid
@@ -41,8 +42,8 @@ from sqlalchemy.exc import IntegrityError
 
 from . import models
 from .errors import ApiError
-from .flow import solve_min_cut, solve_residual_min_cut
-from .validation import validate_segments_known
+from .flow import ResidualCutInfeasible, solve_min_cut, solve_residual_min_cut
+from .validation import validate_review_segments_known
 
 
 def get_plan_or_404(db, plan_id):
@@ -352,27 +353,48 @@ def get_adoption(db, plan_id):
     return adoption
 
 
-def review(db, plan_id, closed_ids):
+def review(db, plan_id, closed_ids, keep_open_ids=None):
     """对当前已采用结果执行一次现场关闭复核并持久化复核记录。
 
     - 复核只读取已采用快照中冻结的方案（采用时刻的版本），绝不读取
       "当前方案"：后来修订的同名管段费用不会混入，算法、校验、持久化
       与接口共享同一冻结版本；
-    - 现场已关闭管段视为已移除，在剩余有向网络上沿用同一最小割裁决
-      （最低费用、源侧按包含关系最小、字典序升序）求追加关闭费用
-      最小的隔断；若已隔断，新增清单为空、追加费用为 0；
-    - 复核记录冻结输入与结果，单行整体一次提交：任何校验失败（未知/
-      重复管段、无采用结果）都在写入前拒绝，写入失败整体回滚，绝不
-      留下半条复核记录，也不修改原方案、计算记录或采用快照。
+    - 现场已关闭管段视为已移除，必须保持开启管段视为不可切断；在其余
+      有向边中沿用同一最小割裁决（最低费用、源侧按包含关系最小、字典序
+      升序）求追加关闭费用最小的隔断。若保持开启约束仍留下污染源到保护
+      区的路径，则以 422 REVIEW_NOT_EXECUTABLE 明确拒绝且不写复核记录；
+    - 复核记录冻结两类现场约束与结果，单行整体一次提交：任何校验失败
+      （未知/重复管段、两类约束重叠、无采用结果、不可执行）都在写入前
+      拒绝，写入失败整体回滚，绝不留下半条复核记录，也不修改原方案、
+      计算记录或采用快照。
     """
     get_plan_or_404(db, plan_id)
     adoption = get_adoption(db, plan_id)
     snapshot = adoption.snapshot
     frozen_plan = snapshot["plan"]
     # 未知管段（含冻结版本之外、后来修订才出现的 ID）在写入前拒绝
-    validate_segments_known(closed_ids, frozen_plan)
+    validate_review_segments_known(closed_ids, keep_open_ids, frozen_plan)
 
-    outcome = solve_residual_min_cut(frozen_plan, closed_ids)
+    try:
+        outcome = solve_residual_min_cut(frozen_plan, closed_ids, keep_open_ids)
+    except ResidualCutInfeasible as exc:
+        db.rollback()
+        raise ApiError(
+            422,
+            "REVIEW_NOT_EXECUTABLE",
+            str(exc),
+            [
+                {
+                    "code": "REQUIRED_OPEN_PATH",
+                    "field": "keep_open_segments",
+                    "message": (
+                        "required-open segments still connect a pollution source "
+                        "to a protected zone"
+                    ),
+                }
+            ],
+        )
+
     created_at = datetime.now(timezone.utc)
     review_id = uuid.uuid4().hex
     record = {
@@ -382,10 +404,16 @@ def review(db, plan_id, closed_ids):
         "computation_id": snapshot["computation_id"],
         "created_at": created_at.isoformat(),
         "closed_segments": outcome["closed_segments"],
-        "additional_segments": outcome["additional_segments"],
-        "additional_cost": outcome["additional_cost"],
-        "witness": outcome["witness"],
     }
+    if keep_open_ids is not None:
+        record["keep_open_segments"] = outcome["keep_open_segments"]
+    record.update(
+        {
+            "additional_segments": outcome["additional_segments"],
+            "additional_cost": outcome["additional_cost"],
+            "witness": outcome["witness"],
+        }
+    )
     row = models.Review(
         review_id=review_id,
         plan_id=plan_id,

@@ -230,14 +230,18 @@ async def create_review(
 ):
     """对当前已采用结果执行现场关闭复核。
 
-    提交现场已关闭管段 ID 集合：服务把这些边视为已移除，只在该次采用
-    快照冻结的方案上（不读取后来修订的同名管段）求追加关闭费用最小的
-    隔断，返回现场已关闭、新增建议、追加费用与合并后的隔断见证。
-    复核记录冻结输入与结果，不修改方案、计算记录或采用快照。
+    提交现场已关闭管段 ID 集合，以及可选的必须保持开启管段 ID 集合：
+    服务把已关闭边视为移除、把保持开启边视为不可切断，只在该次采用快照
+    冻结的方案上（不读取后来修订的同名管段）求追加关闭费用最小的隔断，
+    返回两类现场约束、新增建议、追加费用与合并后的隔断见证。约束使方案
+    不可执行时返回 422 且不写复核记录；复核记录不修改方案、计算记录或
+    采用快照。
     """
     body = await _json_body(request)
-    closed_ids = validate_review_payload(body)
-    review = await to_thread.run_sync(services.review, db, plan_id, closed_ids)
+    closed_ids, keep_open_ids = validate_review_payload(body)
+    review = await to_thread.run_sync(
+        services.review, db, plan_id, closed_ids, keep_open_ids
+    )
     return review.record
 
 
