@@ -238,12 +238,13 @@ def validate_plan_payload(data):
 
 
 def validate_review_payload(data):
-    """校验复核请求负载，返回现场已关闭管段 ID 列表（按提交顺序）。
+    """校验复核请求负载，返回现场已关闭与必须保持开启管段列表。
 
-    负载必须是 ``{"closed_segments": [...]}``：每个元素必须是合法管段
-    ID 且不得重复（现场关闭同一管段两次视为负载非法）。ID 是否存在于
-    所采用的冻结方案中，由 validate_segments_known 在拿到冻结版本后
-    再判定——校验与算法、持久层必须使用同一冻结版本。
+    负载必须至少包含 ``closed_segments``；``open_segments`` 可省略，
+    省略时沿用旧行为（视为空集合）。每个元素必须是合法管段 ID 且
+    在同一类约束中不得重复；两类约束也不得引用同一管段。ID 是否存在
+    于所采用的冻结方案中，由 validate_review_segments_known 在拿到
+    冻结版本后再判定——校验与算法、持久层必须使用同一冻结版本。
     """
     if not isinstance(data, dict):
         raise ApiError(
@@ -252,71 +253,117 @@ def validate_review_payload(data):
             "request body must be a JSON object",
             [_detail("INVALID_BODY", "$", "expected a JSON object")],
         )
-    raw = data.get("closed_segments")
-    if not isinstance(raw, list):
+
+    def segment_list(field, required, invalid_code):
+        if field not in data:
+            if required:
+                raise ApiError(
+                    422,
+                    "VALIDATION_ERROR",
+                    f"{field} must be a list of segment ids",
+                    [
+                        _detail(
+                            invalid_code,
+                            field,
+                            "must be a list of segment ids",
+                        )
+                    ],
+                )
+            return None
+        raw = data[field]
+        if not isinstance(raw, list):
+            raise ApiError(
+                422,
+                "VALIDATION_ERROR",
+                f"{field} must be a list of segment ids",
+                [
+                    _detail(
+                        invalid_code,
+                        field,
+                        "must be a list of segment ids",
+                    )
+                ],
+            )
+        values = []
+        seen = set()
+        details = []
+        for i, seg_id in enumerate(raw):
+            item_field = f"{field}[{i}]"
+            if not _is_valid_id(seg_id):
+                details.append(
+                    _detail(
+                        "INVALID_SEGMENT_ID",
+                        item_field,
+                        "segment id must match [A-Za-z0-9_-]{1,32}",
+                    )
+                )
+            elif seg_id in seen:
+                details.append(
+                    _detail(
+                        "DUPLICATE_SEGMENT_ID",
+                        item_field,
+                        f"duplicate segment id {seg_id!r}",
+                    )
+                )
+            else:
+                seen.add(seg_id)
+                values.append(seg_id)
+        if details:
+            raise ApiError(
+                422, "VALIDATION_ERROR", "review payload is invalid", details
+            )
+        return values
+
+    closed = segment_list(
+        "closed_segments", True, "INVALID_CLOSED_SEGMENTS_FIELD"
+    )
+    open_segments = segment_list(
+        "open_segments", False, "INVALID_OPEN_SEGMENTS_FIELD"
+    )
+
+    overlap = sorted(set(closed) & set(open_segments or []))
+    if overlap:
         raise ApiError(
             422,
             "VALIDATION_ERROR",
-            "closed_segments must be a list of segment ids",
+            "a segment cannot be both closed and required to remain open",
             [
                 _detail(
-                    "INVALID_CLOSED_SEGMENTS_FIELD",
-                    "closed_segments",
-                    "must be a list of segment ids",
+                    "CLOSED_OPEN_SEGMENT_OVERLAP",
+                    "open_segments",
+                    f"segments also listed as closed: {overlap}",
                 )
             ],
         )
-
-    details = []
-    seen = set()
-    closed = []
-    for i, seg_id in enumerate(raw):
-        field = f"closed_segments[{i}]"
-        if not _is_valid_id(seg_id):
-            details.append(
-                _detail(
-                    "INVALID_SEGMENT_ID",
-                    field,
-                    "segment id must match [A-Za-z0-9_-]{1,32}",
-                )
-            )
-        elif seg_id in seen:
-            details.append(
-                _detail(
-                    "DUPLICATE_SEGMENT_ID",
-                    field,
-                    f"duplicate segment id {seg_id!r}",
-                )
-            )
-        else:
-            seen.add(seg_id)
-            closed.append(seg_id)
-    if details:
-        raise ApiError(422, "VALIDATION_ERROR", "review payload is invalid", details)
-    return closed
+    return closed, open_segments
 
 
-def validate_segments_known(closed_ids, frozen_plan):
-    """已关闭管段必须逐一存在于复核所采用的冻结方案中。
+def validate_review_segments_known(closed_ids, open_ids, frozen_plan):
+    """现场约束中的管段必须存在于复核所采用的冻结方案中。
 
     复核只能引用该次采用时冻结的方案：冻结版本中不存在的 ID（包括
     后来修订才新增的管段）一律以 422 UNKNOWN_SEGMENT 拒绝，调用方
     不得写库。
     """
     known = {seg["id"] for seg in frozen_plan["segments"]}
-    details = [
-        _detail(
-            "UNKNOWN_SEGMENT",
-            f"closed_segments[{i}]",
-            f"segment {seg_id!r} does not exist in the adopted plan",
+    details = []
+    for field, segment_ids in (
+        ("closed_segments", closed_ids),
+        ("open_segments", open_ids),
+    ):
+        details.extend(
+            _detail(
+                "UNKNOWN_SEGMENT",
+                f"{field}[{i}]",
+                f"segment {seg_id!r} does not exist in the adopted plan",
+            )
+            for i, seg_id in enumerate(segment_ids)
+            if seg_id not in known
         )
-        for i, seg_id in enumerate(closed_ids)
-        if seg_id not in known
-    ]
     if details:
         raise ApiError(
             422,
             "VALIDATION_ERROR",
-            "closed segments reference segments outside the adopted plan",
+            "review segments reference segments outside the adopted plan",
             details,
         )

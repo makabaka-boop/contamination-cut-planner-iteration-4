@@ -95,11 +95,11 @@ class AdoptionEvent(Base):
 class Review(Base):
     """现场关闭复核记录：对一次已采用结果的执行复核，只增不改。
 
-    记录冻结复核输入（现场已关闭管段）与复核结果（新增建议、追加
-    费用、合并后的隔断见证），并标注它针对的已采用计算与修订号；
-    全部取自采用快照冻结的同一版本。写入不触碰 plans / computations
-    / adoptions / adoption_events，方案随后修订或采用被替换都不影响
-    已落库的复核记录，可按 review_id 在重启后读取。
+    记录冻结复核输入（现场已关闭管段，以及可选的必须保持开启管段）
+    与复核结果（新增建议、追加费用、合并后的隔断见证），并标注它针对
+    的已采用计算与修订号；全部取自采用快照冻结的同一版本。写入不触碰
+    plans / computations / adoptions / adoption_events，方案随后修订或
+    采用被替换都不影响已落库的复核记录，可按 review_id 在重启后读取。
     """
 
     __tablename__ = "reviews"

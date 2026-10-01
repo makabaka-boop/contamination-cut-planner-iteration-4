@@ -62,7 +62,7 @@ docker compose up --build
 | `GET /plans/{plan_id}/computations/{computation_id}` | 查询计算记录 |
 | `POST /plans/{plan_id}/adopt` | 采用一次**成功**计算并保存该计算时刻冻结的完整快照；同一计算**至多采用一次**，即使后来被其他计算替换也不可再次采用；并发采用冲突返回 409 |
 | `GET /plans/{plan_id}/adoption` | 查询当前已采用结果（完整快照） |
-| `POST /plans/{plan_id}/reviews` | 对当前已采用结果执行**现场关闭复核**：提交现场确实已关闭的管段 ID 集合，在采用快照冻结方案的剩余网络上求追加关闭费用最小的隔断；复核记录冻结输入与结果，不修改方案、计算记录或采用快照 |
+| `POST /plans/{plan_id}/reviews` | 对当前已采用结果执行**现场执行复核**：提交现场确实已关闭的管段 ID 集合，以及可选的**必须保持开启**管段 ID 集合；已关闭边视为移除、保持开启边视为不可切断，在采用快照冻结方案的其余管段上求追加关闭费用最小的隔断；约束不可执行时返回 422 且不留记录；成功复核记录冻结两类输入与结果，不修改方案、计算记录或采用快照 |
 | `GET /plans/{plan_id}/reviews/{review_id}` | 按 ID 查询复核记录（冻结的输入与结果，重启后仍可读取） |
 
 ### 调用示例
@@ -151,18 +151,19 @@ curl http://localhost:8000/plans/demo/adoption
 }
 ```
 
-### 施工中途的现场关闭复核
+### 施工中途的现场执行复核
 
 隔断方案施工到一半时，工程师提交现场**确实已关闭**的管段 ID 集合，
-服务把这些边视为已移除，在**该次采用快照冻结的方案**上（绝不读取
-当前方案，后来修订的同名管段费用不会混入）求追加关闭费用最小的
-隔断，算法与初始计算完全一致（Dinic 最大流 + 最小源侧交集 +
-字典序排序）。
+还可提交因现场通风要求**必须保持开启**的管段 ID 集合。服务把已关闭
+边视为已移除、把保持开启边视为不可切断，只在其余管段中，并且只在
+**该次采用快照冻结的方案**上（绝不读取当前方案，后来修订的同名管段
+费用不会混入）求追加关闭费用最小的隔断，算法与初始计算完全一致
+（Dinic 最大流 + 最小源侧交集 + 字典序排序）。
 
 ```bash
 curl -X POST http://localhost:8000/plans/demo/reviews \
   -H 'content-type: application/json' \
-  -d '{"closed_segments": ["p1"]}'
+  -d '{"closed_segments": ["p3"], "open_segments": ["p2"]}'
 ```
 
 ```json
@@ -172,28 +173,38 @@ curl -X POST http://localhost:8000/plans/demo/reviews \
   "plan_revision": 1,
   "computation_id": "6dc73aa10a0d4ee897af3b6abc5d93d7",
   "created_at": "2026-09-26T08:00:00+00:00",
-  "closed_segments": ["p1"],
-  "additional_segments": ["p2"],
-  "additional_cost": 6,
+  "closed_segments": ["p3"],
+  "open_segments": ["p2"],
+  "additional_segments": ["p4"],
+  "additional_cost": 7,
   "witness": {
-    "source_zones": ["SRC1", "SRC2"],
-    "cut_segments": ["p1", "p2"],
-    "total_cost": 10
+    "source_zones": ["MID", "SRC1", "SRC2"],
+    "cut_segments": ["p3", "p4"],
+    "total_cost": 12
   }
 }
 ```
 
 - `closed_segments`：现场已关闭（升序回显）；
-- `additional_segments` / `additional_cost`：新增建议与追加费用；
-  若现场关闭已足以隔断全部污染路径，则清单为空、费用为 0；
+- `open_segments`：必须保持开启（升序回显）。为保持旧响应兼容，仅当
+  请求显式提供该字段（包括空数组）时响应与记录才包含它；旧请求完全
+  不提供时，旧复核响应字段和行为不变；
+- `additional_segments` / `additional_cost`：在其余可切断管段中的新增
+  建议与追加费用；若现场关闭已足以隔断全部污染路径，则清单为空、
+  费用为 0；
 - `witness`：合并后的隔断见证——源侧区域、`已关闭 ∪ 新增` 的完整
-  清单及其按冻结方案费用计算的总费用；删除见证清单中的管段后，
-  冻结方案中不存在任何污染源到保护区的路径。
+  清单及其按冻结方案费用计算的总费用；删除见证清单中的管段并保留全部
+  必须保持开启管段后，冻结方案中不存在任何污染源到保护区的路径。
+
+若已关闭管段移除后，仍有污染源到保护区的路径，而该路径只经过必须
+保持开启的管段，则任何追加关闭都不可执行。服务返回
+`422 REVIEW_NOT_EXECUTABLE`，**不创建复核记录**。
 
 复核记录只增不改：方案随后修订、采用被其他计算替换，都不影响已
 落库的复核记录，仍可按 `review_id` 读取；其中 `plan_revision` 与
-`computation_id` 标明它针对的是哪一次冻结版本。未知管段（含后来
-修订才新增的 ID）、重复管段、无采用结果都以 422/404 拒绝且**不留
+`computation_id` 标明它针对的是哪一次冻结版本。两类约束都只能引用
+该冻结方案中的管段，未知管段（含后来修订才新增的 ID）、重复管段、
+同一管段同时出现在两类集合中、无采用结果都以 422/404 拒绝且**不留
 任何记录**；数据库写入失败整体回滚（500），不留下半条复核记录，
 也绝不修改原方案、计算记录或采用快照。
 
@@ -205,7 +216,8 @@ curl -X POST http://localhost:8000/plans/demo/reviews \
 | 404 | `PLAN_NOT_FOUND` / `COMPUTATION_NOT_FOUND` / `ADOPTION_NOT_FOUND` / `REVIEW_NOT_FOUND` / `NOT_FOUND` | 资源不存在 |
 | 409 | `REVISION_CONFLICT` | 保存冲突，`details[].code` 区分：`PLAN_ALREADY_EXISTS`（并发首次创建同一方案，落败请求）/ `REVISION_MISMATCH`（携带的 `expected_revision` 已过期，方案在读取后被他人修改）；重新读取当前方案与修订号后再提交 |
 | 409 | `COMPUTATION_ALREADY_ADOPTED` / `COMPUTATION_NOT_ADOPTABLE` / `ADOPTION_CONFLICT` | 计算已被采用过（含已被替换下来的历史采用）/ 计算未成功 / 并发采用时当前生效结果已被他人改变，请重新查询后再采用 |
-| 422 | `VALIDATION_ERROR` | 负载非法，`details[].code` 给出细分原因（如 `INVALID_ZONE_ID`、`DUPLICATE_SEGMENT_ID`、`UNKNOWN_ZONE`、`INVALID_COST`、`EMPTY_SOURCES`、`SOURCE_PROTECTION_OVERLAP`、`TOO_MANY_ZONES`、`TOO_MANY_SEGMENTS`、`INVALID_EXPECTED_REVISION`、`UNKNOWN_SEGMENT`、`INVALID_CLOSED_SEGMENTS_FIELD` 等） |
+| 422 | `VALIDATION_ERROR` | 负载非法，`details[].code` 给出细分原因（如 `INVALID_ZONE_ID`、`DUPLICATE_SEGMENT_ID`、`UNKNOWN_ZONE`、`INVALID_COST`、`EMPTY_SOURCES`、`SOURCE_PROTECTION_OVERLAP`、`TOO_MANY_ZONES`、`TOO_MANY_SEGMENTS`、`INVALID_EXPECTED_REVISION`、`UNKNOWN_SEGMENT`、`INVALID_CLOSED_SEGMENTS_FIELD`、`INVALID_OPEN_SEGMENTS_FIELD`、`CLOSED_OPEN_SEGMENT_OVERLAP` 等） |
+| 422 | `REVIEW_NOT_EXECUTABLE` | 现场已关闭边移除后，仍有污染源到保护区的路径，且路径上的其余边全部被要求保持开启；任何追加切断都不可执行，不创建复核记录 |
 | 500 | `INTERNAL_ERROR` / `COMPUTATION_FAILED` | 服务内部错误 |
 
 非法整版、计算失败、采用不存在或已采用过的结果，以及并发保存的落败
@@ -266,11 +278,13 @@ pytest
 - `tests/test_snapshot.py`：计算后修订再采用时快照的方案/修订/清单/费用
   逐项冻结且能隔断快照内污染路径；采用被替换后旧计算不可重用；历史采用
   次数核对；冲突不改写当前方案与生效快照。
-- `tests/test_review.py`：现场关闭复核——小图独立枚举对拍（全部合法
-  划分 × 多组已关闭子集）、非建议管段先被关闭、零费用边与"已隔断则
-  新增为空"、方案修订后复核仍使用冻结版本且不改写方案/计算/采用快照、
-  复核记录按 ID 读取（含 8 线程并发读取一致），以及未知/重复管段、
-  无采用结果、数据库写入失败都不留下半条记录。
+- `tests/test_review.py`：现场执行复核——小图独立枚举对拍（全部合法
+  划分 × 多组已关闭/必须保持开启组合，并直接枚举可选切断集合）、非建议
+  管段先被关闭、必须保持开启迫使改选其他割、零费用边与"已隔断则新增为
+  空"、约束不可执行且不留记录、方案修订后复核仍使用冻结版本且不改写
+  方案/计算/采用快照、未提供新字段时旧响应逐字段兼容、复核记录按 ID
+  读取（含 8 线程并发读取一致），以及未知/重复管段、两类约束重叠、无
+  采用结果、数据库写入失败都不留下半条记录。
 - `tests/test_concurrency_pg.py`：**仅在真实 PostgreSQL 下运行**
   （SQLite 自动跳过），在数据库层确定性地卡住两次操作：
   - 并发首次创建同一方案：一胜（200 修订 1）一负（409
@@ -292,8 +306,8 @@ pytest
 app/
   main.py        FastAPI 路由与全局异常处理
   flow.py        自实现 64 位整数容量 Dinic 最大流 / 最小割（含剩余网络复核）
-  validation.py  方案负载与复核负载的域校验（稳定错误码）
-  services.py    保存、计算、采用、复核、查询业务逻辑
+  validation.py  方案负载与现场执行复核负载的域校验（稳定错误码）
+  services.py    保存、计算、采用、执行复核、查询业务逻辑
   models.py      plans / computations / adoptions / adoption_events / reviews 表
   db.py          引擎、会话、建表（带重试）
   errors.py      统一错误信封
